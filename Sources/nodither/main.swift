@@ -1,10 +1,12 @@
 // nodither: stop temporal dithering on external displays (Apple Silicon, SDR).
-//   apply      set each external display's link to 8-bit RGB (full range), then set enableDither = No
-//   status     show enableDither and the current link format per external display
-//   install    copy this binary to ~/.local/bin and load a LaunchAgent that runs `agent`
-//              at login and whenever a display is attached
-//   uninstall  unload and remove the LaunchAgent and the installed binary
-//   agent      (run by the LaunchAgent) wait for displays to settle, then `apply`
+//   apply [monitor ...]    set each external display's link to 8-bit (RGB full range when offered),
+//                          then set enableDither = No
+//   status                 show enableDither and the current link format per external display
+//   install [monitor ...]  copy this binary to ~/.local/bin and load a LaunchAgent that runs
+//                          `agent` at login and whenever a display is attached
+//   uninstall              unload the LaunchAgent, restore the link and dithering defaults, remove files
+//   agent [monitor ...]    (run by the LaunchAgent) wait for displays to settle, then `apply`
+// Monitor names are case-insensitive substrings; without any, all external displays are managed.
 
 import CoreGraphics
 import Foundation
@@ -45,7 +47,18 @@ struct LinkDescription: Equatable {
     var encoding: UInt32  // 0 = RGB, 1 = YCbCr 4:4:4, 2 = YCbCr 4:2:2
 
     static let zero = LinkDescription(bitDepth: 0, range: 0, eotf: 0, encoding: 0)
-    static let rgb8Full = LinkDescription(bitDepth: 8, range: 1, eotf: 0, encoding: 0)
+
+    var name: String {
+        let encodings: [UInt32: String] = [0: "RGB", 1: "YCbCr 4:4:4", 2: "YCbCr 4:2:2"]
+        return "\(bitDepth)-bit \(encodings[encoding] ?? "encoding \(encoding)"), \(range == 1 ? "full" : "limited") range"
+    }
+}
+
+/// Monitor name filters from the command line; empty means every external display.
+var only = Array(CommandLine.arguments.dropFirst(2))
+func managed(_ name: String?) -> Bool {
+    guard !only.isEmpty else { return true }
+    return name.map { n in only.contains { n.localizedCaseInsensitiveContains($0) } } ?? false
 }
 
 /// Set when any step fails; becomes the exit status, which `launchctl print` shows.
@@ -122,7 +135,9 @@ func externalDisplays() -> [CGDirectDisplayID] {
     return ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 }
 }
 
-func setLinkModes() {
+/// Set each managed external display's link to the preferred 8-bit link, or with `restore` to
+/// WindowServer's own choice (the first link it lists, which is what it picks by default).
+func setLinks(restore: Bool = false) {
     guard let getMode = SLSGetCurrentDisplayMode, let getLinks = SLSGetDisplayOutputModeLinkDescriptions,
           let configure = SLSConfigureDisplayOutputMode else {
         return fail("link: SkyLight output-mode API not found on this macOS, skipping")
@@ -132,6 +147,7 @@ func setLinkModes() {
     var config: CGDisplayConfigRef?
     for id in externalDisplays() {
         let name = fbs.lazy.compactMap(\.monitor).first { $0.id == Monitor.id(id) }?.name ?? "display \(id)"
+        guard managed(name) else { continue }
         var mode: Int32 = 0
         var descs = [LinkDescription](repeating: .zero, count: 32)
         var count = Int32(descs.count), current: Int32 = -1
@@ -140,41 +156,49 @@ func setLinkModes() {
             continue
         }
         descs = Array(descs.prefix(Int(count)))
-        if descs.indices.contains(Int(current)), descs[Int(current)] == .rgb8Full {
-            print("\(name): link already 8-bit RGB")
+        // Any 8-bit SDR link leaves the monitor nothing to dither; encoding and range only affect
+        // color accuracy. Prefer RGB, then YCbCr 4:4:4, then 4:2:2, and full range over limited.
+        let target = restore ? descs.first : descs.filter { $0.bitDepth == 8 && $0.eotf == 0 }
+            .min { ($0.encoding, $0.range == 1 ? 0 : 1) < ($1.encoding, $1.range == 1 ? 0 : 1) }
+        guard let target else {
+            fail("\(name): no \(restore ? "" : "8-bit ")link offered for the current mode")
             continue
         }
-        guard descs.contains(.rgb8Full) else {
-            print("\(name): 8-bit RGB full range is not offered for the current mode")
+        if descs.indices.contains(Int(current)), descs[Int(current)] == target {
+            print("\(name): link already \(target.name)")
             continue
         }
         if config == nil, CGBeginDisplayConfiguration(&config) != .success {
             return fail("could not begin display configuration")
         }
-        let t = LinkDescription.rgb8Full
-        let err = configure(config!, id, UInt64(t.bitDepth) | UInt64(t.range) << 32, UInt64(t.eotf) | UInt64(t.encoding) << 32)
-        err == .success ? print("\(name): set link to 8-bit RGB") : fail("\(name): set link failed (\(err.rawValue))")
+        let err = configure(config!, id, UInt64(target.bitDepth) | UInt64(target.range) << 32,
+                            UInt64(target.eotf) | UInt64(target.encoding) << 32)
+        err == .success ? print("\(name): set link to \(target.name)") : fail("\(name): set link failed (\(err.rawValue))")
     }
     if let config, CGCompleteDisplayConfiguration(config, .permanently) != .success {
         fail("display configuration failed")
     }
 }
 
-func disableDither() {
+func setDither(_ enabled: Bool) {
     let fbs = externalFramebuffers()
     if fbs.isEmpty { fail("no external display pipes found") }
+    if !only.isEmpty, !fbs.contains(where: { $0.monitor != nil && managed($0.monitor?.name) }) {
+        fail("no connected monitor matches \(only.joined(separator: ", "))")
+    }
     for fb in fbs {
         defer { IOObjectRelease(fb.service) }
+        guard managed(fb.monitor?.name) else { continue }
         let name = fb.monitor?.name ?? "(no display)"
-        let kr = IORegistryEntrySetCFProperty(fb.service, "enableDither" as CFString, kCFBooleanFalse)
-        kr == KERN_SUCCESS ? print("\(name): enableDither = No")
+        let kr = IORegistryEntrySetCFProperty(fb.service, "enableDither" as CFString, enabled ? kCFBooleanTrue : kCFBooleanFalse)
+        kr == KERN_SUCCESS ? print("\(name): enableDither = \(enabled ? "Yes" : "No")")
                            : fail("\(name): enableDither failed: \(String(cString: mach_error_string(kr)))")
     }
 }
 
 func apply() {
-    setLinkModes()
-    disableDither()
+    setLinks()
+    setDither(false)
 }
 
 /// Launched by launchd at login and when a display attaches; nothing stays resident between runs.
@@ -243,7 +267,7 @@ func install() throws {
     let log = home.appendingPathComponent("Library/Logs/nodither.log").path
     let plist: [String: Any] = [
         "Label": label,
-        "ProgramArguments": [installedBinary.path, "agent"],
+        "ProgramArguments": [installedBinary.path, "agent"] + only,
         "RunAtLoad": true,
         // launchd watches IOKit and starts us only when a monitor's AV service appears.
         "LaunchEvents": ["com.apple.iokit.matching": ["display attached": [
@@ -264,7 +288,13 @@ func install() throws {
 }
 
 func uninstall() {
+    // Restore exactly the monitors the installed agent managed.
+    if let args = NSDictionary(contentsOf: agentPlist)?["ProgramArguments"] as? [String] {
+        only = Array(args.dropFirst(2))
+    }
     launchctl("bootout", "gui/\(getuid())/\(label)")
+    setLinks(restore: true)
+    setDither(true)
     try? FileManager.default.removeItem(at: agentPlist)
     try? FileManager.default.removeItem(at: installedBinary)
     print("removed \(agentPlist.path) and \(installedBinary.path)")
@@ -277,7 +307,7 @@ case "status": status()
 case "install": do { try install() } catch { fail("install failed: \(error)") }
 case "uninstall": uninstall()
 default:
-    print("usage: nodither apply | status | install | uninstall")
+    print("usage: nodither apply [monitor ...] | install [monitor ...] | status | uninstall")
     exit(2)
 }
 exit(failed ? 1 : 0)

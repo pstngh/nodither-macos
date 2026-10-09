@@ -35,10 +35,12 @@ Either way, `install` copies the binary to `~/.local/bin/nodither` and loads the
 
 | Command | |
 |---|---|
-| `nodither apply` | Set 8-bit RGB links, then `enableDither = No` |
+| `nodither apply [monitor ...]` | Set 8-bit links (RGB full range when offered), then `enableDither = No` |
 | `nodither status` | Show `enableDither` and the current link per external display |
-| `nodither install` | Install the binary and LaunchAgent |
-| `nodither uninstall` | Remove the LaunchAgent and the installed binary |
+| `nodither install [monitor ...]` | Install the binary and LaunchAgent |
+| `nodither uninstall` | Remove the LaunchAgent and binary, and restore the default link and dithering |
+
+Monitors are matched by any part of their name, ignoring case (`nodither install U4323`). Without names, every external display is managed. `uninstall` restores exactly the monitors the installed agent managed.
 
 ```
 $ nodither status
@@ -55,7 +57,7 @@ The log is at `~/Library/Logs/nodither.log`.
 ## How it works
 
 - **Dithering:** `IORegistryEntrySetCFProperty(enableDither = false)` on every `IOMobileFramebufferAP` marked `external` (the parent class of `AppleCLCD2` and `IOMobileFramebufferShim`).
-- **Link:** WindowServer's private SkyLight output-mode API. `SLSGetDisplayOutputModeLinkDescriptions` lists the links the current display mode supports, and `SLSConfigureDisplayOutputMode` selects `{BitDepth 8, Range full, EOTF SDR, PixelEncoding RGB}`. WindowServer saves the choice as `LinkDescription` in its display preferences and restores it when the monitor reconnects.
+- **Link:** WindowServer's private SkyLight output-mode API. `SLSGetDisplayOutputModeLinkDescriptions` lists the links the current display mode supports, and `SLSConfigureDisplayOutputMode` selects an 8-bit SDR link: RGB full range when offered, otherwise RGB limited, then YCbCr 4:4:4, then 4:2:2. Any 8-bit link leaves the monitor nothing to dither; encoding and range only affect color accuracy. WindowServer saves the choice as `LinkDescription` in its display preferences and restores it when the monitor reconnects.
 - **Status:** `enableDither` comes from the IORegistry (what `ioreg -lw0 | grep enableDither` shows). The link comes from the DCP itself via `IOAVVideoInterfaceGetLinkData`, so it reports what is actually on the cable. Monitors are matched across IOKit, the DCP and CoreGraphics by their EDID product ID and serial.
 - **Reapplying with zero overhead:** nothing stays resident. The LaunchAgent uses launchd's `com.apple.iokit.matching` event stream on `DCPAVServiceProxy` (`Location = External`), which the DCP publishes each time a monitor attaches, including after the Mac wakes from sleep. launchd starts `nodither agent`, which waits for WindowServer to bring the display online, applies, and exits. `RunAtLoad` covers login.
 
@@ -77,7 +79,8 @@ BetterDisplay does far more: a GUI, any connection mode including ones WindowSer
 - SDR only. HDR needs a 10-bit link.
 - `enableDither` resets on reboot; the LaunchAgent sets it again at login.
 - Display mode changes don't undo it. WindowServer applies the saved 8-bit RGB link to whatever mode is active, so a game that switches resolution or refresh rate keeps it, and GPU dithering stays off across the link retrain (tested 4K60 → 4K30 and 240 → 120 Hz, during the switch and after the game quits).
-- `uninstall` does not switch the link back, because WindowServer keeps the saved setting. Choose a different connection mode (e.g. in BetterDisplay) to change it.
+- Night Shift, color profile switches and gamma changes don't reset the link or `enableDither` (tested).
+- `uninstall` switches each managed monitor back to the link WindowServer picks by default and turns GPU dithering back on.
 
 ## Credits
 
