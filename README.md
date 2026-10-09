@@ -59,6 +59,17 @@ The log is at `~/Library/Logs/nodither.log`.
 - **Status:** `enableDither` comes from the IORegistry (what `ioreg -lw0 | grep enableDither` shows). The link comes from the DCP itself via `IOAVVideoInterfaceGetLinkData`, so it reports what is actually on the cable. Monitors are matched across IOKit, the DCP and CoreGraphics by their EDID product ID and serial.
 - **Reapplying with zero overhead:** nothing stays resident. The LaunchAgent uses launchd's `com.apple.iokit.matching` event stream on `DCPAVServiceProxy` (`Location = External`), which the DCP publishes each time a monitor attaches, including after the Mac wakes from sleep. launchd starts `nodither agent`, which waits for WindowServer to bring the display online, applies, and exits. `RunAtLoad` covers login.
 
+## Compared to BetterDisplay
+
+[BetterDisplay](https://github.com/waydabber/BetterDisplay) can also turn off GPU dithering and pick a connection mode. Tested against BetterDisplay 5.1.1 on the same Mac:
+
+- **GPU dithering: same mechanism.** BetterDisplay writes `enableDither` with `IORegistryEntrySetCFProperty`, like Stillcolor and `nodither`. The difference is reapplying: BetterDisplay has to keep running and polls the displays every 2 seconds, while `nodither` only runs at login, monitor attach and wake.
+- **Connection mode: same options, different layer.** BetterDisplay lists the same link options WindowServer offers, but programs the display hardware underneath WindowServer. When BetterDisplay switched the U4323QE to 10-bit, the monitor received 10-bit while WindowServer's current output mode and saved preferences still said 8-bit. At the next game-style mode switch, WindowServer put back its own saved link and the BetterDisplay setting was lost. BetterDisplay's "Configuration Protection" exists to switch it back again after such events (not tested here).
+
+`nodither` sets the link in WindowServer itself, so macOS keeps it on its own across monitor power cycles, sleep/wake and mode switches, with nothing running in between.
+
+BetterDisplay does far more: a GUI, any connection mode including ones WindowServer wouldn't choose, HDR, presets, and testing across many Macs. If you run both, leave BetterDisplay's connection-mode protection off so the two don't fight over the link.
+
 ## Notes
 
 - Uses private Apple APIs, so a macOS update can break it. If one disappears, that step is skipped and the run exits 1; turning off GPU dithering only needs public IOKit, so it still happens.
