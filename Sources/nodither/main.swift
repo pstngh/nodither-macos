@@ -188,16 +188,20 @@ func agent() {
     }
     // Wait until WindowServer has every connected external display online and
     // nothing new has attached for 2 s (max 30 s), so the link is up before we touch it.
-    let start = Date()
-    while Date().timeIntervalSince(start) < 30 {
-        let fbs = externalFramebuffers()
-        let connected = fbs.filter { $0.monitor != nil }.count
-        fbs.forEach { IOObjectRelease($0.service) }
-        if connected > 0, externalDisplays().count >= connected,
-           lock.withLock({ Date().timeIntervalSince(lastEvent) }) >= 2 { break }
-        usleep(250_000)
-    }
-    apply()
+    // Go again if another display attached after that, since its event was delivered to us.
+    var settled: Date
+    repeat {
+        let start = Date()
+        repeat {
+            settled = lock.withLock { lastEvent }
+            let fbs = externalFramebuffers()
+            let connected = fbs.filter { $0.monitor != nil }.count
+            fbs.forEach { IOObjectRelease($0.service) }
+            if connected > 0, externalDisplays().count >= connected, Date().timeIntervalSince(settled) >= 2 { break }
+            usleep(250_000)
+        } while Date().timeIntervalSince(start) < 30
+        apply()
+    } while lock.withLock({ lastEvent }) != settled
 }
 
 func status() {
