@@ -54,6 +54,7 @@ The log is at `~/Library/Logs/nodither.log`.
 - Tested on a Mac mini M4 with macOS 26.6 and two Dell monitors (one on HDMI, one on USB-C), including a monitor power cycle. Other chips and macOS versions are untested.
 - SDR only. HDR needs a 10-bit link.
 - `enableDither` resets on reboot; the LaunchAgent sets it again at login.
+- Display mode changes don't undo it. WindowServer applies the saved 8-bit RGB link to whatever mode is active, so a game that switches resolution or refresh rate keeps it, and GPU dithering stays off across the link retrain (tested 4K60 → 4K30 and 240 → 120 Hz, during the switch and after the game quits).
 - `uninstall` does not switch the link back, because WindowServer keeps the saved setting. Choose a different connection mode (e.g. in BetterDisplay) to change it.
 
 ## Credits
