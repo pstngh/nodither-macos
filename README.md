@@ -31,10 +31,10 @@ swift build -c release
 
 ```
 $ nodither status
-DELL U4323QE [dispext0]
+DELL U4323QE
   enableDither  No
   link          8-bit RGB, full range
-DELL G2524H [disp0]
+DELL G2524H
   enableDither  No
   link          8-bit RGB, full range
 ```
@@ -45,12 +45,12 @@ The log is at `~/Library/Logs/nodither.log`.
 
 - **Dithering:** `IORegistryEntrySetCFProperty(enableDither = false)` on every `IOMobileFramebufferAP` marked `external` (the parent class of `AppleCLCD2` and `IOMobileFramebufferShim`).
 - **Link:** WindowServer's private SkyLight output-mode API. `SLSGetDisplayOutputModeLinkDescriptions` lists the links the current display mode supports, and `SLSConfigureDisplayOutputMode` selects `{BitDepth 8, Range full, EOTF SDR, PixelEncoding RGB}`. WindowServer saves the choice as `LinkDescription` in its display preferences and restores it when the monitor reconnects.
-- **Status:** `enableDither` comes from the IORegistry (what `ioreg -lw0 | grep enableDither` shows). The link comes from the DCP itself via `IOAVVideoInterfaceGetLinkData`, so it reports what is actually on the cable.
+- **Status:** `enableDither` comes from the IORegistry (what `ioreg -lw0 | grep enableDither` shows). The link comes from the DCP itself via `IOAVVideoInterfaceGetLinkData`, so it reports what is actually on the cable. Monitors are matched across IOKit, the DCP and CoreGraphics by their EDID product ID and serial.
 - **Reapplying with zero overhead:** nothing stays resident. The LaunchAgent uses launchd's `com.apple.iokit.matching` event stream on `DCPAVServiceProxy` (`Location = External`), which the DCP publishes each time a monitor attaches. launchd starts `nodither agent`, which waits for WindowServer to bring the display online, applies, and exits. `RunAtLoad` covers login.
 
 ## Notes
 
-- Uses private Apple APIs, so a macOS update can break it.
+- Uses private Apple APIs, so a macOS update can break it. If one disappears, that step is skipped and the run exits 1; turning off GPU dithering only needs public IOKit, so it still happens.
 - Tested on a Mac mini M4 with macOS 26.6 and two Dell monitors (one on HDMI, one on USB-C), including a monitor power cycle. Other chips and macOS versions are untested.
 - SDR only. HDR needs a 10-bit link.
 - `enableDither` resets on reboot; the LaunchAgent sets it again at login.

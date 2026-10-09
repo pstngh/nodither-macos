@@ -11,12 +11,10 @@ import Foundation
 import IOKit
 import XPC
 
-// MARK: - Private API (resolved at runtime)
+// MARK: - Private API (resolved at runtime; nil if a macOS update removes it)
 
-private func sym<T>(_ lib: String, _ name: String, _: T.Type) -> T {
-    guard let handle = dlopen(lib, RTLD_LAZY), let p = dlsym(handle, name) else {
-        fatalError("\(name) not found in \(lib)")
-    }
+private func sym<T>(_ lib: String, _ name: String, _: T.Type) -> T? {
+    guard let handle = dlopen(lib, RTLD_LAZY), let p = dlsym(handle, name) else { return nil }
     return unsafeBitCast(p, to: T.self)
 }
 
@@ -34,6 +32,8 @@ private let SLSConfigureDisplayOutputMode = sym(skyLight, "SLSConfigureDisplayOu
 
 private let IOAVVideoInterfaceCreateWithService = sym(ioKit, "IOAVVideoInterfaceCreateWithService",
     (@convention(c) (CFAllocator?, io_service_t) -> Unmanaged<CFTypeRef>?).self)
+private let IOAVVideoInterfaceCopyDisplayAttributes = sym(ioKit, "IOAVVideoInterfaceCopyDisplayAttributes",
+    (@convention(c) (CFTypeRef) -> Unmanaged<CFDictionary>?).self)
 private let IOAVVideoInterfaceGetLinkData = sym(ioKit, "IOAVVideoInterfaceGetLinkData",
     (@convention(c) (CFTypeRef, UnsafeMutableRawPointer) -> IOReturn).self)
 
@@ -48,63 +48,69 @@ struct LinkDescription: Equatable {
     static let rgb8Full = LinkDescription(bitDepth: 8, range: 1, eotf: 0, encoding: 0)
 }
 
-// MARK: - IORegistry
-
-struct Framebuffer {
-    let service: io_service_t
-    let node: String       // display pipe, e.g. "disp0", "dispext0"
-    let name: String?      // monitor name; nil when nothing is connected
-    let productID: Int?
-    let serial: Int?
+/// Set when any step fails; becomes the exit status, which `launchctl print` shows.
+var failed = false
+func fail(_ message: String) {
+    print(message)
+    failed = true
 }
 
-/// External display pipes. Matches IOMobileFramebufferAP like Stillcolor (parent class of AppleCLCD2 and IOMobileFramebufferShim).
-func externalFramebuffers() -> [Framebuffer] {
-    var result: [Framebuffer] = []
+// MARK: - IORegistry
+
+/// All services of an IOKit class; the caller releases them.
+func services(_ cls: String) -> [io_service_t] {
     var iter: io_iterator_t = 0
-    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOMobileFramebufferAP"), &iter) == KERN_SUCCESS else { return [] }
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(cls), &iter) == KERN_SUCCESS else { return [] }
     defer { IOObjectRelease(iter) }
-    while case let service = IOIteratorNext(iter), service != 0 {
-        guard property(service, "external") as? Bool == true else { IOObjectRelease(service); continue }
-        var parent: io_registry_entry_t = 0
-        var name = [CChar](repeating: 0, count: 128)
-        if IORegistryEntryGetParentEntry(service, kIOServicePlane, &parent) == KERN_SUCCESS {
-            IORegistryEntryGetName(parent, &name)
-            IOObjectRelease(parent)
-        }
-        let product = (property(service, "DisplayAttributes") as? [String: Any])?["ProductAttributes"] as? [String: Any]
-        result.append(Framebuffer(service: service, node: String(cString: name),
-                                  name: product?["ProductName"] as? String,
-                                  productID: product?["ProductID"] as? Int,
-                                  serial: product?["SerialNumber"] as? Int))
-    }
-    return result
+    return Array(AnyIterator { let s = IOIteratorNext(iter); return s == 0 ? nil : s })
 }
 
 func property(_ entry: io_registry_entry_t, _ key: String) -> Any? {
     IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
 }
 
-/// Current link as reported by the display coprocessor (DCP) driving this pipe:
-/// disp0 is driven by dcp, dispextN by dcpextN.
-func currentLink(_ fb: Framebuffer) -> (depth: UInt32, encoding: UInt32, limited: Bool)? {
-    let dcp = fb.node.hasPrefix("dispext") ? "dcpext" + fb.node.dropFirst("dispext".count) : "dcp"
-    var iter: io_iterator_t = 0
-    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVVideoInterfaceProxy"), &iter) == KERN_SUCCESS else { return nil }
-    defer { IOObjectRelease(iter) }
-    while case let service = IOIteratorNext(iter), service != 0 {
-        defer { IOObjectRelease(service) }
-        var path = [CChar](repeating: 0, count: 1024)
-        guard IORegistryEntryGetPath(service, kIOServicePlane, &path) == KERN_SUCCESS,
-              String(cString: path).contains("/\(dcp)@"),
-              let iface = IOAVVideoInterfaceCreateWithService(kCFAllocatorDefault, service)?.takeRetainedValue()
-        else { continue }
-        // The active color element sits at offset 8: depth, pixel encoding, dynamic range (0 = full), ...
-        var data = [UInt32](repeating: 0, count: 64)
-        guard IOAVVideoInterfaceGetLinkData(iface, &data) == kIOReturnSuccess, data[2] != 0 else { return nil }
-        return (data[2], data[3], data[4] != 0)
+/// A monitor from DisplayAttributes.ProductAttributes. The framebuffer, the DCP video interface
+/// and CoreGraphics all report the same product ID and serial, which ties the three together.
+struct Monitor {
+    let id: String
+    let name: String
+
+    init?(_ displayAttributes: Any?) {
+        guard let p = (displayAttributes as? [String: Any])?["ProductAttributes"] as? [String: Any] else { return nil }
+        id = "\(p["ProductID"] as? Int ?? 0)/\(p["SerialNumber"] as? Int ?? 0)"
+        name = p["ProductName"] as? String ?? "display \(id)"
     }
-    return nil
+
+    static func id(_ display: CGDirectDisplayID) -> String {
+        "\(CGDisplayModelNumber(display))/\(CGDisplaySerialNumber(display))"
+    }
+}
+
+/// External display pipes, matched via IOMobileFramebufferAP like Stillcolor (parent class of
+/// AppleCLCD2 and IOMobileFramebufferShim). `monitor` is nil when nothing is connected.
+func externalFramebuffers() -> [(service: io_service_t, monitor: Monitor?)] {
+    services("IOMobileFramebufferAP").compactMap { service in
+        guard property(service, "external") as? Bool == true else { IOObjectRelease(service); return nil }
+        return (service, Monitor(property(service, "DisplayAttributes")))
+    }
+}
+
+/// Current link per monitor id, as reported by the display coprocessor (DCP) itself.
+func currentLinks() -> [String: String] {
+    guard let create = IOAVVideoInterfaceCreateWithService, let copyAttributes = IOAVVideoInterfaceCopyDisplayAttributes,
+          let getLinkData = IOAVVideoInterfaceGetLinkData else { return [:] }
+    let encodings: [UInt32: String] = [0: "RGB", 2: "YCbCr 4:2:2", 3: "YCbCr 4:4:4"]
+    var links: [String: String] = [:]
+    for service in services("DCPAVVideoInterfaceProxy") {
+        defer { IOObjectRelease(service) }
+        guard let iface = create(kCFAllocatorDefault, service)?.takeRetainedValue(),
+              let monitor = Monitor(copyAttributes(iface)?.takeRetainedValue()) else { continue }
+        // The active color element starts at offset 8: depth, pixel encoding, dynamic range (0 = full), ...
+        var data = [UInt32](repeating: 0, count: 64)
+        guard getLinkData(iface, &data) == kIOReturnSuccess, data[2] != 0 else { continue }
+        links[monitor.id] = "\(data[2])-bit \(encodings[data[3]] ?? "encoding \(data[3])"), \(data[4] == 0 ? "full" : "limited") range"
+    }
+    return links
 }
 
 // MARK: - Commands
@@ -116,23 +122,21 @@ func externalDisplays() -> [CGDirectDisplayID] {
     return ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 }
 }
 
-func displayName(_ id: CGDirectDisplayID, _ fbs: [Framebuffer]) -> String {
-    let fb = fbs.first { $0.productID == Int(CGDisplayModelNumber(id)) && $0.serial == Int(CGDisplaySerialNumber(id)) }
-    return fb?.name ?? "display \(id)"
-}
-
 func setLinkModes() {
+    guard let getMode = SLSGetCurrentDisplayMode, let getLinks = SLSGetDisplayOutputModeLinkDescriptions,
+          let configure = SLSConfigureDisplayOutputMode else {
+        return fail("link: SkyLight output-mode API not found on this macOS, skipping")
+    }
     let fbs = externalFramebuffers()
     defer { fbs.forEach { IOObjectRelease($0.service) } }
     var config: CGDisplayConfigRef?
     for id in externalDisplays() {
-        let name = displayName(id, fbs)
+        let name = fbs.lazy.compactMap(\.monitor).first { $0.id == Monitor.id(id) }?.name ?? "display \(id)"
         var mode: Int32 = 0
         var descs = [LinkDescription](repeating: .zero, count: 32)
         var count = Int32(descs.count), current: Int32 = -1
-        guard SLSGetCurrentDisplayMode(id, &mode) == .success,
-              SLSGetDisplayOutputModeLinkDescriptions(id, mode, &descs, &count, &current) == .success else {
-            print("\(name): could not read link modes")
+        guard getMode(id, &mode) == .success, getLinks(id, mode, &descs, &count, &current) == .success else {
+            fail("\(name): could not read link modes")
             continue
         }
         descs = Array(descs.prefix(Int(count)))
@@ -144,23 +148,27 @@ func setLinkModes() {
             print("\(name): 8-bit RGB full range is not offered for the current mode")
             continue
         }
-        if config == nil { CGBeginDisplayConfiguration(&config) }
+        if config == nil, CGBeginDisplayConfiguration(&config) != .success {
+            return fail("could not begin display configuration")
+        }
         let t = LinkDescription.rgb8Full
-        let err = SLSConfigureDisplayOutputMode(config!, id, UInt64(t.bitDepth) | UInt64(t.range) << 32,
-                                                UInt64(t.eotf) | UInt64(t.encoding) << 32)
-        print("\(name): set link to 8-bit RGB -> \(err == .success ? "ok" : "error \(err.rawValue)")")
+        let err = configure(config!, id, UInt64(t.bitDepth) | UInt64(t.range) << 32, UInt64(t.eotf) | UInt64(t.encoding) << 32)
+        err == .success ? print("\(name): set link to 8-bit RGB") : fail("\(name): set link failed (\(err.rawValue))")
     }
-    if let config {
-        let err = CGCompleteDisplayConfiguration(config, .permanently)
-        if err != .success { print("display configuration failed: error \(err.rawValue)") }
+    if let config, CGCompleteDisplayConfiguration(config, .permanently) != .success {
+        fail("display configuration failed")
     }
 }
 
 func disableDither() {
-    for fb in externalFramebuffers() {
+    let fbs = externalFramebuffers()
+    if fbs.isEmpty { fail("no external display pipes found") }
+    for fb in fbs {
         defer { IOObjectRelease(fb.service) }
+        let name = fb.monitor?.name ?? "(no display)"
         let kr = IORegistryEntrySetCFProperty(fb.service, "enableDither" as CFString, kCFBooleanFalse)
-        print("\(fb.name ?? "(no display)") [\(fb.node)]: enableDither = No -> \(String(cString: mach_error_string(kr)))")
+        kr == KERN_SUCCESS ? print("\(name): enableDither = No")
+                           : fail("\(name): enableDither failed: \(String(cString: mach_error_string(kr)))")
     }
 }
 
@@ -183,28 +191,24 @@ func agent() {
     let start = Date()
     while Date().timeIntervalSince(start) < 30 {
         let fbs = externalFramebuffers()
-        let connected = fbs.filter { $0.name != nil }.count
+        let connected = fbs.filter { $0.monitor != nil }.count
         fbs.forEach { IOObjectRelease($0.service) }
-        let online = externalDisplays().count
-        if connected > 0, online >= connected, lock.withLock({ Date().timeIntervalSince(lastEvent) }) >= 2 { break }
+        if connected > 0, externalDisplays().count >= connected,
+           lock.withLock({ Date().timeIntervalSince(lastEvent) }) >= 2 { break }
         usleep(250_000)
     }
-    status()
     apply()
 }
 
 func status() {
-    let encodings: [UInt32: String] = [0: "RGB", 2: "YCbCr 4:2:2", 3: "YCbCr 4:4:4"]
+    let links = currentLinks()
     let fbs = externalFramebuffers()
     defer { fbs.forEach { IOObjectRelease($0.service) } }
-    for fb in fbs where fb.name != nil {
-        let dither = (property(fb.service, "enableDither") as? Bool).map { $0 ? "Yes" : "No" } ?? "?"
-        let link = currentLink(fb).map {
-            "\($0.depth)-bit \(encodings[$0.encoding] ?? "encoding \($0.encoding)"), \($0.limited ? "limited" : "full") range"
-        } ?? "unknown"
-        print("\(fb.name!) [\(fb.node)]")
+    for case let (service, monitor?) in fbs {
+        let dither = (property(service, "enableDither") as? Bool).map { $0 ? "Yes" : "No" } ?? "?"
+        print(monitor.name)
         print("  enableDither  \(dither)")
-        print("  link          \(link)")
+        print("  link          \(links[monitor.id] ?? "unknown")")
     }
 }
 
@@ -251,8 +255,8 @@ func install() throws {
     let domain = "gui/\(getuid())"
     launchctl("bootout", "\(domain)/\(label)")
     let rc = launchctl("bootstrap", domain, agentPlist.path)
-    print(rc == 0 ? "installed \(installedBinary.path)\nloaded \(agentPlist.path) (log: \(log))"
-                  : "launchctl bootstrap failed (\(rc))")
+    rc == 0 ? print("installed \(installedBinary.path)\nloaded \(agentPlist.path) (log: \(log))")
+            : fail("launchctl bootstrap failed (\(rc))")
 }
 
 func uninstall() {
@@ -266,9 +270,10 @@ switch CommandLine.arguments.dropFirst().first {
 case "apply": apply()
 case "agent": agent()
 case "status": status()
-case "install": do { try install() } catch { print("install failed: \(error)"); exit(1) }
+case "install": do { try install() } catch { fail("install failed: \(error)") }
 case "uninstall": uninstall()
 default:
     print("usage: nodither apply | status | install | uninstall")
     exit(2)
 }
+exit(failed ? 1 : 0)
