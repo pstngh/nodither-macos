@@ -11,6 +11,17 @@ The 8-bit link alone just moves the dithering from the monitor to the GPU. Turni
 
 ## Install
 
+Prebuilt binary from the [latest release](https://github.com/pstngh/nodither-macos/releases/latest) (arm64, macOS 13 or later):
+
+```bash
+curl -L https://github.com/pstngh/nodither-macos/releases/latest/download/nodither-macos-arm64.tar.gz | tar xz
+./nodither install
+```
+
+The binary is ad-hoc signed, not notarized. Downloads made with `curl` run as-is; if you download the archive in a browser, macOS blocks the binary until you run `xattr -d com.apple.quarantine nodither`.
+
+Or build from source (needs the Xcode Command Line Tools):
+
 ```bash
 git clone https://github.com/pstngh/nodither-macos
 cd nodither-macos
@@ -18,7 +29,7 @@ swift build -c release
 .build/release/nodither install
 ```
 
-`install` copies the binary to `~/.local/bin/nodither` and loads the LaunchAgent `~/Library/LaunchAgents/local.nodither.plist`. It applies the settings right away, at every login, and whenever a monitor is attached. No root needed.
+Either way, `install` copies the binary to `~/.local/bin/nodither` and loads the LaunchAgent `~/Library/LaunchAgents/local.nodither.plist`. It applies the settings right away, at every login, and whenever a monitor is attached. No root needed.
 
 ## Usage
 
